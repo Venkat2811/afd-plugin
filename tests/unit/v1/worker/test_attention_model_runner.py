@@ -22,6 +22,7 @@ from afd_plugin.model_executor.models.forward_context import (
 from afd_plugin.v1.worker.attention_metadata import _is_ubatch_child_afd_context
 from afd_plugin.v1.worker.attention_model_runner import (
     AFDAttentionModelRunner,
+    _ubatch_split_crosses_request,
     fail_if_cuda_graph_enabled,
     fail_if_unsupported_ubatching,
 )
@@ -632,6 +633,95 @@ def test_determine_batch_execution_overrides_ubatch_only_for_dp1(
         "num-tokens-across-dp",
         "cudagraph-stats",
     )
+
+
+@pytest.mark.parametrize(
+    ("scheduled_tokens", "padded_tokens", "num_ubatches", "expected"),
+    [
+        pytest.param([4], 4, 2, True, id="one-spec-request-crosses"),
+        pytest.param([4, 4], 8, 2, False, id="two-spec-requests-align"),
+        pytest.param([1, 1, 1, 1], 4, 2, False, id="decode-requests-align"),
+        pytest.param([3, 3], 8, 2, True, id="padded-split-crosses"),
+        pytest.param([4], 8, 2, False, id="padded-split-after-real-tokens"),
+        pytest.param([4], 4, 1, False, id="one-ubatch-has-no-split"),
+    ],
+)
+def test_ubatch_split_crosses_request(
+    scheduled_tokens,
+    padded_tokens,
+    num_ubatches,
+    expected,
+):
+    assert (
+        _ubatch_split_crosses_request(
+            scheduled_tokens,
+            padded_tokens,
+            num_ubatches,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("cudagraph_mode", "scheduled_tokens", "expected"),
+    [
+        pytest.param(
+            CUDAGraphMode.FULL,
+            [4],
+            False,
+            id="full-graph-request-crossing-is-disabled",
+        ),
+        pytest.param(
+            CUDAGraphMode.FULL,
+            [4, 4],
+            True,
+            id="full-graph-request-boundary-is-kept",
+        ),
+        pytest.param(
+            CUDAGraphMode.NONE,
+            [4],
+            True,
+            id="eager-request-crossing-is-kept",
+        ),
+    ],
+)
+def test_determine_batch_execution_guards_full_graph_request_crossing(
+    monkeypatch,
+    cudagraph_mode,
+    scheduled_tokens,
+    expected,
+):
+    runner = _ubatch_runner(
+        True,
+        data_parallel_size=1,
+        use_ubatching=True,
+        num_ubatches=2,
+        dbo_decode_token_threshold=2,
+    )
+    num_tokens = sum(scheduled_tokens)
+    batch_descriptor = SimpleNamespace(num_tokens=num_tokens)
+    parent_result = (
+        cudagraph_mode,
+        batch_descriptor,
+        False,
+        "num-tokens-across-dp",
+        "cudagraph-stats",
+    )
+    monkeypatch.setattr(
+        GPUModelRunner,
+        "_determine_batch_execution_and_padding",
+        lambda _self, *_args, **_kwargs: parent_result,
+    )
+
+    result = runner._determine_batch_execution_and_padding(
+        num_tokens=num_tokens,
+        num_reqs=len(scheduled_tokens),
+        num_scheduled_tokens_np=scheduled_tokens,
+        max_num_scheduled_tokens=max(scheduled_tokens),
+        use_cascade_attn=False,
+    )
+
+    assert result[2] is expected
 
 
 def test_attention_metadata_disables_cross_ubatch_block_table_cache(

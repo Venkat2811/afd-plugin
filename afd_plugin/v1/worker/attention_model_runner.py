@@ -285,6 +285,22 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
             num_tokens = int(values.get("num_tokens", 0))
             should_ubatch = num_tokens >= max(num_ubatches, 1)
 
+        # vLLM adjusts a request-crossing ubatch's sequence lengths by cloning
+        # the persistent tensor. That clone captures a stale pointer/value in a
+        # FULL CUDA graph, so replay corrupts attention once context lengths
+        # change. Keep DBO when all split points are request boundaries, and
+        # otherwise use the non-ubatched FULL graph for this batch.
+        if (
+            should_ubatch
+            and cudagraph_mode == CUDAGraphMode.FULL
+            and _ubatch_split_crosses_request(
+                num_scheduled_tokens_np,
+                batch_descriptor.num_tokens,
+                self.vllm_config.parallel_config.num_ubatches,
+            )
+        ):
+            should_ubatch = False
+
         return (
             cudagraph_mode,
             batch_descriptor,
@@ -575,6 +591,27 @@ def _batch_execution_values(
     values = dict(zip(names, args, strict=False))
     values.update(kwargs)
     return values
+
+
+def _ubatch_split_crosses_request(
+    num_scheduled_tokens: np.ndarray,
+    num_tokens_padded: int,
+    num_ubatches: int,
+) -> bool:
+    """Return whether an equal-token ubatch split cuts through a request."""
+
+    if num_ubatches <= 1 or len(num_scheduled_tokens) == 0:
+        return False
+
+    request_ends = np.cumsum(num_scheduled_tokens, dtype=np.int64)
+    real_num_tokens = int(request_ends[-1])
+    request_boundaries = {int(end) for end in request_ends}
+    tokens_per_ubatch = int(num_tokens_padded) // num_ubatches
+
+    return any(
+        0 < split_point < real_num_tokens and split_point not in request_boundaries
+        for split_point in (tokens_per_ubatch * i for i in range(1, num_ubatches))
+    )
 
 
 @contextmanager
