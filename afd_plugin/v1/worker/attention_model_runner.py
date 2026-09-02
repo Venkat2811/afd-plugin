@@ -12,6 +12,7 @@ import torch
 import vllm.v1.worker.gpu_model_runner as gpu_model_runner
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.distributed import get_pp_group
 from vllm.forward_context import (
     BatchDescriptor,
     get_forward_context,
@@ -23,6 +24,8 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
+from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner, PerLayerAttnMetadata
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.ubatch_utils import (
@@ -31,6 +34,7 @@ from vllm.v1.worker.ubatch_utils import (
     is_last_ubatch_empty,
 )
 
+from afd_plugin.compat.patches.spec_decode_drafters import configure_afd_drafter
 from afd_plugin.compat.profiler import (
     create_afd_gpu_profiler,
     step_afd_gpu_profiler,
@@ -87,6 +91,13 @@ class AFDAttentionModelRunner(AFDMetadataProviderMixin, GPUModelRunner):
         self._afd_suppress_metadata_send = False
         self._afd_transaction_counter = 0
         self.prof = create_afd_gpu_profiler("attention")
+        if self.speculative_config is not None and get_pp_group().is_last_rank:
+            drafter = self.drafter
+            if isinstance(
+                drafter,
+                (SpecDecodeBaseProposer, ExtractHiddenStatesProposer),
+            ):
+                configure_afd_drafter(drafter, self)
 
     @staticmethod
     def parse_config(vllm_config: VllmConfig) -> AFDConfig:

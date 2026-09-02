@@ -1,51 +1,110 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the AFD plugin project
-"""Keep AFD's control plane out of speculative drafter forwards.
+"""Keep AFD's control plane out of model-based drafter dummy forwards.
 
-Patch reason: during dummy runs AFD wraps ``create_forward_context`` globally,
-so a model-based drafter's forward (DFlash) is instrumented too. The drafter is
-a dense model that never crosses the attention/FFN boundary, yet AFD announced
-a transaction for it -- the FFN role then waits forever on data that never
-arrives (deadlock), or the DP=1 metadata synthesis rejects the drafter's
-context shape ("AFD DP=1 fallback only supports one stage").
-Patch functionality: wrap ``DFlashProposer.dummy_run`` so the announce is
-suppressed while transaction metadata installs stay intact.
-Signature: matches upstream; no added parameters.
-Upstream: vLLM v0.26.0, vllm/v1/spec_decode/dflash.py
+During a target-model dummy run, AFD temporarily instruments vLLM's
+``create_forward_context`` factory. Model-based proposers create another
+forward context inside that scope, but their local model never crosses AFD's
+attention/FFN boundary. Announcing that nested context leaves the FFN role
+waiting for data that will never be sent.
+
+The owning AFD runner installs this compatibility wrapper on its own proposer
+instance. DFlash and ``SpecDecodeBaseProposer`` implementations (including the
+Eagle family, draft-model proposers, Gemma4, and Step3p5 MTP) share the wrapped
+``dummy_run`` signature. ``ExtractHiddenStatesProposer`` has the same contract
+and is configured by the runner too. Custom proposers are intentionally out of
+scope because the plugin cannot assume that their forwards stay local.
+
+Real proposal forwards need no wrapper: AFD's context-factory provider is only
+active around target dummy/capture runs.
 """
 
 from __future__ import annotations
 
 from functools import wraps
+from types import MethodType
+from typing import TYPE_CHECKING, Protocol
+from weakref import ref
 
-from afd_plugin.v1.worker.attention_metadata import suppress_afd_announce
+if TYPE_CHECKING:
+    import torch
 
-_WRAPPED_ATTR = "_afd_announce_suppressed"
+_WRAPPED_ATTR = "_afd_dummy_run_announce_suppressed"
 
 
-def _wrap_dummy_run(proposer_cls: type) -> None:
-    original = proposer_cls.dummy_run
-    if getattr(original, _WRAPPED_ATTR, False):
+class _AFDMetadataRunner(Protocol):
+    _afd_suppress_metadata_send: bool
+
+
+class ModelBasedDrafter(Protocol):
+    """Model-based vLLM proposer interface used by the AFD wrapper."""
+
+    def dummy_run(
+        self,
+        num_tokens: int,
+        use_cudagraphs: bool = True,
+        is_graph_capturing: bool = False,
+        slot_mappings: dict[str, torch.Tensor] | None = None,
+    ) -> None: ...
+
+
+def configure_afd_drafter(
+    proposer: ModelBasedDrafter,
+    runner: _AFDMetadataRunner,
+) -> None:
+    """Suppress AFD announces only for one runner's nested drafter forwards."""
+
+    if proposer.__dict__.get(_WRAPPED_ATTR, False):
         return
 
-    @wraps(original)
-    def dummy_run(self, *args, **kwargs):
-        with suppress_afd_announce():
-            return original(self, *args, **kwargs)
+    original_dummy_run = type(proposer).dummy_run
+    runner_ref = ref(runner)
 
-    setattr(dummy_run, _WRAPPED_ATTR, True)
-    proposer_cls.dummy_run = dummy_run
+    # Patch reason: a model-based drafter dummy forward is nested inside AFD's
+    # target-runner context provider but does not cross the AFD boundary.
+    # Patch functionality: retain AFD transaction installation while suppressing
+    # its unmatched control-plane announce on this runner instance only.
+    # Signature: matches vLLM v0.26.0 model-based proposer dummy_run methods.
+    # Delegation exception: upstream dummy_run implementations own substantial,
+    # proposer-specific logic; this wrapper changes only the AFD runner flag.
+    # Upstream sources: vllm/v1/spec_decode/{llm_base_proposer,dflash,
+    # extract_hidden_states}.py. Remove when vLLM exposes scoped nested-forward
+    # metadata providers or retains the proposer-to-runner dependency itself.
+    @wraps(original_dummy_run)
+    def dummy_run(
+        self: ModelBasedDrafter,
+        num_tokens: int,
+        use_cudagraphs: bool = True,
+        is_graph_capturing: bool = False,
+        slot_mappings: dict[str, torch.Tensor] | None = None,
+    ) -> None:
+        owning_runner = runner_ref()
+        if owning_runner is None:
+            return original_dummy_run(
+                self,
+                num_tokens,
+                use_cudagraphs=use_cudagraphs,
+                is_graph_capturing=is_graph_capturing,
+                slot_mappings=slot_mappings,
+            )
+
+        # ### PATCH START: scope suppression to the owning AFD runner.
+        previous_suppress_send = owning_runner._afd_suppress_metadata_send
+        owning_runner._afd_suppress_metadata_send = True
+        try:
+            original_dummy_run(
+                self,
+                num_tokens,
+                use_cudagraphs=use_cudagraphs,
+                is_graph_capturing=is_graph_capturing,
+                slot_mappings=slot_mappings,
+            )
+        finally:
+            owning_runner._afd_suppress_metadata_send = previous_suppress_send
+        # ### PATCH END: scope suppression to the owning AFD runner.
+
+    proposer.dummy_run = MethodType(dummy_run, proposer)
+    proposer.__dict__[_WRAPPED_ATTR] = True
 
 
-def _apply() -> None:
-    # Eagle-family proposers run their own drafter forwards inside the same
-    # dummy-run scope and are expected to need the same treatment; only DFlash
-    # is wrapped here because only DFlash has been validated end to end.
-    try:
-        from vllm.v1.spec_decode.dflash import DFlashProposer
-    except Exception:  # pragma: no cover - older vLLM without DFlash
-        return
-    _wrap_dummy_run(DFlashProposer)
-
-
-_apply()
+__all__ = ["configure_afd_drafter"]

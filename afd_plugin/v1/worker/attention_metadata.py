@@ -4,32 +4,6 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-
-# Module-level switch: while set, install_afd_metadata_on_forward_context still
-# installs transaction metadata (so AFDUBatchWrapper and model code keep their
-# invariants) but skips the control-plane announce. Needed for forwards that AFD
-# instruments via its global create_forward_context wrapper but that never cross
-# the attention/FFN boundary -- e.g. a dense speculative drafter's forward, which
-# would otherwise leave the FFN role waiting on a transaction that never sends.
-_ANNOUNCE_SUPPRESSED = False
-
-
-@contextmanager
-def _suppress_announce_scope():
-    global _ANNOUNCE_SUPPRESSED
-    previous = _ANNOUNCE_SUPPRESSED
-    _ANNOUNCE_SUPPRESSED = True
-    try:
-        yield
-    finally:
-        _ANNOUNCE_SUPPRESSED = previous
-
-
-def suppress_afd_announce():
-    """Context manager: suppress AFD's control-plane announce, keep installs."""
-    return _suppress_announce_scope()
-
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_world_group
@@ -235,8 +209,6 @@ class AFDMetadataProviderMixin:
                 self._afd_pending_metadata
             )
         if getattr(self, "_afd_suppress_metadata_send", False):
-            return
-        if _ANNOUNCE_SUPPRESSED:
             return
         dp_metadata = forward_context.dp_metadata
         ubatch_slices = forward_context.ubatch_slices
