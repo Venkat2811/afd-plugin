@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from afd_plugin.v1.worker.cuda_graph import (
+    FULL,
     FULL_DECODE_ONLY,
     AFDGraphRunMode,
     cudagraph_mode_name,
@@ -65,10 +66,26 @@ def test_cuda_graph_policy_allows_full_decode_only_for_ffn():
 
 
 @pytest.mark.parametrize(
-    "mode",
-    [None, "NONE", "FULL", "PIECEWISE", "FULL_AND_PIECEWISE"],
+    ("role", "allow_attention", "enable_ffn"),
+    [("attention", True, False), ("ffn", False, True)],
 )
-def test_cuda_graph_policy_rejects_non_full_decode_only_graph_modes(mode):
+def test_cuda_graph_policy_allows_full(role, allow_attention, enable_ffn):
+    policy = validate_cuda_graph_mode(
+        _config(enforce_eager=False, cudagraph_mode=FULL),
+        role=role,
+    )
+
+    assert policy.enabled is True
+    assert policy.mode_name == FULL
+    assert policy.allow_attention_full_decode_only is allow_attention
+    assert policy.enable_ffn_graph_cache is enable_ffn
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [None, "NONE", "PIECEWISE", "FULL_AND_PIECEWISE"],
+)
+def test_cuda_graph_policy_rejects_unsupported_graph_modes(mode):
     with pytest.raises(RuntimeError, match="FULL_DECODE_ONLY"):
         validate_cuda_graph_mode(
             _config(enforce_eager=False, cudagraph_mode=mode),
@@ -76,11 +93,12 @@ def test_cuda_graph_policy_rejects_non_full_decode_only_graph_modes(mode):
         )
 
 
-def test_cuda_graph_policy_allows_two_way_ubatching_with_full_decode_only_graph():
+@pytest.mark.parametrize("mode", [FULL, FULL_DECODE_ONLY])
+def test_cuda_graph_policy_allows_two_way_ubatching_with_full_graph(mode):
     policy = validate_cuda_graph_mode(
         _config(
             enforce_eager=False,
-            cudagraph_mode=FULL_DECODE_ONLY,
+            cudagraph_mode=mode,
             use_ubatching=True,
             num_ubatches=2,
         ),

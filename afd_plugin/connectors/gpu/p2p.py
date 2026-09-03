@@ -5,8 +5,8 @@
 ``P2pNcclAFDConnector`` exchanges hidden states synchronously between
 disaggregated Attention and FFN workers through NCCL point-to-point
 communication, implemented with vLLM's ``PyNcclCommunicator``. It supports
-both prefill and decode; eager mode is supported and CUDA graph support is
-currently limited to ``FULL_DECODE_ONLY``.
+both prefill and decode; eager mode is supported, as are the ``FULL`` and
+``FULL_DECODE_ONLY`` CUDA graph modes.
 
 Topology:
     The connector creates one AFD NCCL world ordered as

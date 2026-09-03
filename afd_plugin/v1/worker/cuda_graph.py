@@ -17,8 +17,9 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
+FULL = "FULL"
 FULL_DECODE_ONLY = "FULL_DECODE_ONLY"
-_SUPPORTED_GRAPH_MODES = {FULL_DECODE_ONLY}
+_SUPPORTED_GRAPH_MODES = {FULL, FULL_DECODE_ONLY}
 
 
 class AFDGraphRunMode(str, Enum):
@@ -61,7 +62,7 @@ def validate_cuda_graph_mode(
     if mode_name not in _SUPPORTED_GRAPH_MODES:
         role_suffix = f" for {role}" if role else ""
         raise RuntimeError(
-            "AFD only supports CUDA graph mode "
+            "AFD only supports CUDA graph modes FULL and "
             f"{FULL_DECODE_ONLY}{role_suffix}; got {mode_name!r}.",
         )
 
@@ -72,7 +73,7 @@ def validate_cuda_graph_mode(
     if use_ubatching and not allow_ubatching:
         raise RuntimeError(
             "AFD CUDA graph support currently supports ubatching only for "
-            f"{FULL_DECODE_ONLY} with exactly two ubatches; "
+            "FULL or FULL_DECODE_ONLY with exactly two ubatches; "
             f"got num_ubatches={num_ubatches!r}.",
         )
 
@@ -202,6 +203,7 @@ def _aggregate_ffn_values_tuple(
 __all__ = [
     "AFDCUDAGraphPolicy",
     "AFDGraphRunMode",
+    "FULL",
     "FULL_DECODE_ONLY",
     "cudagraph_mode_name",
     "graph_run_mode",
